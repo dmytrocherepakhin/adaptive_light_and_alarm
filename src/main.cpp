@@ -1,42 +1,34 @@
 #include <Arduino.h>
 #include "config.h"
+#include "Button.h"
+#include "Ldr.h"
+#include "Led.h"
 
-const u16_t LDR_threshold = 3500;
-const u32_t debounceDelay = 50;
-
-u16_t adcPeriod = 100;
-u32_t lastAdcReadTime = 0;
-
-u16_t freq = 5000;
-u16_t dutyCycle = 128;
-
-u16_t alarmLightDelay = 500;
 u32_t lastAlarmLightTime = 0;
-u8_t alarmLightState = LOW;
+u32_t lastCrashLightTime = 0;
+u8_t alarmLightState = false;
+u8_t crashLightState = false;
 
-u8_t button_emerg_state = LOW;
-u8_t last_button_emerg_reading = LOW;
-u8_t stable_button_emerg_state = LOW;
-u32_t last_button_emerg_change_time = 0;
+bool automaticWhiteState = false;
+const u16_t ldrHysteresis = 100;
 
-// u8_t button_crash_state = LOW;
-// u8_t last_button_crash_reading = LOW;
-// u8_t stable_button_crash_state = LOW;
-// u8_t last_button_crash_change_time = 0;
-
-u32_t adc_on_timer = 0;
-u32_t adc_off_timer = 0;
-u16_t adc_delay = 1000;
+Button emergencyButton;
+Button crashButton;
+Ldr ldr;
+Led whiteLed;
+Led yellowLed;
+Led pwmLed;
 
 void setup()
 {
-  pinMode(LDR, INPUT);
-  pinMode(LED_W, OUTPUT);
-  pinMode(LED_Y, OUTPUT);
-  pinMode(BUTTON_EMERGENCY, INPUT);
-  // pinMode(BUTTON_CRASH, INPUT);
-  pinMode(LED_PWM, OUTPUT);
-  analogWriteFrequency(freq);
+  emergencyButton.init(BUTTON_EMERGENCY);
+  crashButton.init(BUTTON_CRASH);
+  ldr.init(LDR);
+  whiteLed.init(LED_W);
+  yellowLed.init(LED_Y);
+  pwmLed.init(LED_PWM);
+
+  analogWriteFrequency(ANALOG_FREQUENCY);
   Serial.begin(115200);
   Serial.println("Alarm - setuped\n");
 }
@@ -44,65 +36,63 @@ void setup()
 void loop()
 {
   const u32_t now = millis();
-  const u8_t readingEmerg = digitalRead(BUTTON_EMERGENCY);
-  // const u8_t readingCrash = digitalRead(BUTTON_CRASH);
 
-  if (readingEmerg != last_button_emerg_reading)
+  emergencyButton.poll(now);
+  crashButton.poll(now);
+  ldr.poll(now);
+
+  bool readingEmerg = emergencyButton.get_state();
+  bool readingCrash = crashButton.get_state();
+  u32_t adcValue = ldr.get_value();
+
+  if (adcValue < LDR_THRESHOLD - ldrHysteresis)
   {
-    last_button_emerg_change_time = now;
-    last_button_emerg_reading = readingEmerg;
+    automaticWhiteState = true;
   }
-  if (now - last_button_emerg_change_time >= debounceDelay && readingEmerg != stable_button_emerg_state)
+  else if (adcValue > LDR_THRESHOLD + ldrHysteresis)
   {
-    stable_button_emerg_state = readingEmerg;
-    if (stable_button_emerg_state == HIGH)
-    {
-      button_emerg_state = !button_emerg_state;
-    }
+    automaticWhiteState = false;
   }
-  if (button_emerg_state)
+
+  u16_t limitedAdcValue = constrain(adcValue, 2000, 4000);
+  u8_t dutyCycle = map(limitedAdcValue, 2000, 4000, 5, 255);
+
+  pwmLed.set_duty(dutyCycle);
+
+  if (readingCrash)
   {
-    if (now - lastAlarmLightTime >= alarmLightDelay && button_emerg_state)
+    if (now - lastCrashLightTime >= CRASH_LIGHT_DELAY)
     {
-      lastAlarmLightTime = now;
-      alarmLightState = !alarmLightState;
-      digitalWrite(LED_Y, alarmLightState ? HIGH : LOW);
+      lastCrashLightTime = now;
+      whiteLed.set_state(crashLightState ? HIGH : LOW);
+      yellowLed.set_state(crashLightState ? HIGH : LOW);
+      crashLightState = !crashLightState;
     }
   }
   else
   {
-    lastAlarmLightTime = 0;
-    alarmLightState = LOW;
-    digitalWrite(LED_Y, LOW);
-  }
+    lastCrashLightTime = 0;
+    crashLightState = false;
 
-  if (now - lastAdcReadTime >= adcPeriod)
-  {
-    lastAdcReadTime = now;
-    u16_t adc_value = analogRead(LDR);
-    u16_t limitedAdcValue = constrain(adc_value, 2000, 4000);
-    dutyCycle = map(limitedAdcValue, 2000, 4000, 5, 255);
-    analogWrite(LED_PWM, dutyCycle);
+    whiteLed.set_state(automaticWhiteState);
 
-    if (adc_value < LDR_threshold)
+    if (readingEmerg)
     {
-      adc_off_timer = 0;
-      adc_on_timer = (adc_on_timer == 0) ? now : adc_on_timer;
-      if (adc_value < LDR_threshold && now - adc_on_timer >= adc_delay)
+      if (now - lastAlarmLightTime >= ALARM_LIGHT_DELAY)
       {
-        digitalWrite(LED_W, HIGH);
+        lastAlarmLightTime = now;
+        yellowLed.set_state(alarmLightState ? HIGH : LOW);
+        alarmLightState = !alarmLightState;
       }
     }
     else
     {
-      adc_on_timer = 0;
-      adc_off_timer = (adc_off_timer == 0) ? now : adc_off_timer;
-      if (adc_value >= LDR_threshold && now - adc_off_timer >= adc_delay)
-      {
-        digitalWrite(LED_W, LOW);
-      }
+      lastAlarmLightTime = 0;
+      yellowLed.set_state(LOW);
+      alarmLightState = false;
     }
-
-    Serial.printf("ADC value: %d   Duty cycle: %d  Alarm is enabled: %s\n", adc_value, dutyCycle, button_emerg_state ? "YES" : "NO");
   }
+
+  Serial.printf("ADC value: %d   Duty cycle: %d  Alarm is enabled: %s Is crashed: %s\n",
+                adcValue, dutyCycle, readingEmerg ? "YES" : "NO", readingCrash ? "YES" : "NO");
 }
